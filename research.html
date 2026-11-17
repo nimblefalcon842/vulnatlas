@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CVE-2026-98260: use-after-free of a POSIX CPU timer object across a failed exec | VulnAtlas Research</title>
+<meta name="description" content="VulnAtlas Research independent verification of CVE-2026-98260, a use-after-free of a POSIX timer object (k_itimer) in the Linux kernel, reproduced on Linux 6.6.157.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header>
+<div class="brand">VulnAtlas Research</div>
+<nav><a href="index.html">Home</a><a href="about.html">About</a><a href="research.html" aria-current="page">Research</a><a href="disclosure.html">Disclosure</a><a href="contact.html">Contact</a></nav>
+</header>
+<main>
+<article>
+<h1>CVE-2026-98260: a use-after-free of a POSIX CPU timer object across a failed exec</h1>
+<p class="byline">VulnAtlas Research | 2026-11-17</p>
+<p>VulnAtlas Research | 2026-11-17</p>
+<p>The issue was found and disclosed by Hyunwoo Kim (V4bel), with public</p>
+<p>disclosure on oss-security on 16 October 2026. This writeup makes no</p>
+<p>priority claim: my contribution is independent verification only, my own</p>
+<p>reproduction, root-cause analysis and reverse-engineering confirmation on</p>
+<p>Linux 6.6.157.</p>
+<h2>1. Verdict</h2>
+<p>CVE-2026-98260 is a use-after-free of a POSIX timer object (k_itimer) in</p>
+<p>the Linux kernel timer subsystem, reproduced in my local lab on Linux</p>
+<p>6.6.157.</p>
+<ul>
+<li>Phase 1 evidence: crash-only GPF/Oops on the plain kernel (runs 14 and</li>
+</ul>
+<p>  16), and a deterministic kill-delay sweep bounding the race window</p>
+<p>  (100 us hit and the clean re-capture hit are observed runs pinned in my</p>
+<p>  lab logs; the 50 us no-hit point is a runbook sweep value, not a pinned</p>
+<p>  lab observation).</p>
+<ul>
+<li>Phase 2 evidence: a KASAN kernel run with a slab-use-after-free report,</li>
+</ul>
+<p>  slab-use-after-free in timerqueue_del(), Read of size 8, with the full</p>
+<p>  object lifecycle pinned by the report&#x27;s alloc/free/read stacks (alloc</p>
+<p>  task 846, free-executing task 803, reader task 57; three distinct task</p>
+<p>  IDs support the multithreaded-child fact).</p>
+<p>Fix attribution (live-verified): Hyunwoo Kim (V4bel) + Thomas Gleixner</p>
+<p>series; fix commit acb03d3881818581052924a9bbbe92b8741ed448, cited from</p>
+<p>its own commit message (V3 posting, Sep 11 patch email), which carries the</p>
+<p>full race anatomy. Thomas Gleixner&#x27;s LKML series &quot;[patch V2 0/8]</p>
+<p>exec/exit: POSIX timer related bugfixes&quot; (Sep 5-7, Frederic Weisbecker</p>
+<p>review) is the public discussion context for the mechanism; the commit</p>
+<p>message itself is the mechanism record this analysis cites.</p>
+<h2>2. Mechanism: one chain, kill and exec are one event</h2>
+<p>Race anatomy (upstream record, one chain): a non-leader thread of a</p>
+<p>multithreaded child arms a per-thread CPU timer (CLOCK_THREAD_CPUTIME_ID)</p>
+<p>and execve()s; the exec fails on a late failure path and unwinds (-EINTR);</p>
+<p>the delayed kill lands during the killable exec wait and the unwind</p>
+<p>continues through get_signal -&gt; do_exit -&gt; exit_itimers, which frees the</p>
+<p>k_itimer while its node is still queued. exit_itimers() here SKIPS the</p>
+<p>disarm of the queued node (the bug); the parent&#x27;s wait4() reaping then</p>
+<p>runs posix_cpu_timers_exit() -&gt; timerqueue_del() on the freed node.</p>
+<p>Reaching the bug from a plain (non-exec) exit is not possible per the</p>
+<p>upstream record; my lab reproduced the exec-failure variant. Proof of the</p>
+<p>exec precondition is the driver design plus the observed</p>
+<p>timer_lock_sighand failed-lookup WARNING</p>
+<p>(kernel/time/posix-cpu-timers.c:564), not the free stack; exec frames are</p>
+<p>absent from the free stack because the exec unwind has already completed</p>
+<p>after -EINTR.</p>
+<p>The fix, acb03d388181 (&quot;exec: Cleanup POSIX timers right after</p>
+<p>de_thread()&quot;, fs/exec.c, +21/-8; Signed-off-by Hyunwoo Kim and Thomas</p>
+<p>Gleixner; Reviewed-by Oleg Nesterov and Frederic Weisbecker; Cc: stable),</p>
+<p>does not add a barrier at exit or harden the reap-time walk. It creates a</p>
+<p>helper posixtimer_exec() (posix_cpu_timers_exit(me) + exit_itimers(me) +</p>
+<p>flush_itimer_signals() under the sighand siglock, gated on</p>
+<p>CONFIG_POSIX_TIMERS) and calls it in begin_new_exec() immediately after</p>
+<p>de_thread() returns success, removing the identical cleanup block from its</p>
+<p>old, later position. The comment states the requirement: the cleanup must</p>
+<p>run there so that CPU timers armed on the current task are dequeued from</p>
+<p>me::posix_cputimers before any post-point_of_no_return failure path</p>
+<p>(unshare_files(), set_mm_exe_file(), exec_mmap(),</p>
+<p>exec_task_namespaces()) can bring the task down; after the TID switch, a</p>
+<p>later deletion of the timer would not remove an enqueued timer because the</p>
+<p>old-TID lookup fails.</p>
+<h2>3. What my lab pinned</h2>
+<ul>
+<li>Crash-only GPF/Oops on the near-defconfig plain kernel (runs 14, 16).</li>
+<li>Kill-delay sweep bounding the window; the working sweep point and the</li>
+</ul>
+<p>  re-captured full splat are pinned in my lab logs.</p>
+<ul>
+<li>Phase 2 KASAN run: slab-use-after-free, faulting access</li>
+</ul>
+<p>  timerqueue_del(), Read of size 8 (timerqueue-node read). The free is an</p>
+<p>  RCU-deferred free queued from exit_itimers() at process exit and</p>
+<p>  executed later by rcu_core (kmem_cache_free). The reader is the reaping</p>
+<p>  path: release_task() -&gt; posix_cpu_timers_exit() -&gt; timerqueue_del(),</p>
+<p>  i.e. a parent in wait4() reaping an exited child that created a POSIX</p>
+<p>  timer via timer_create().</p>
+<ul>
+<li>do_group_exit provenance: the free stack&#x27;s do_group_exit -&gt; do_exit -&gt;</li>
+</ul>
+<p>  exit_itimers+0x347 -&gt; __call_rcu_common (the deferred-free queue) is the</p>
+<p>  tail of the SAME chain as the upstream exec-failure path, not a separate</p>
+<p>  kill variant: the non-leader thread fails execve on a late failure path,</p>
+<p>  the exec unwinds (-EINTR), and the delayed kill lands during the</p>
+<p>  killable exec wait. Kill and exec are ONE chain.</p>
+<ul>
+<li>Pinned stack: exit_itimers+0x347 -&gt; __call_rcu_common, because the</li>
+</ul>
+<p>  reader&#x27;s UAF dereferences the node after the RCU-deferred free that</p>
+<p>  chain queues. The log&#x27;s second exit_itimers frame (+0x4b5, with</p>
+<p>  posix_cpu_timer_del) is the same teardown event&#x27;s disarm/delete call</p>
+<p>  site, not a second free path.</p>
+<h2>4. Production reachability</h2>
+<ul>
+<li>Is the vulnerable path reachable in the default/production config? YES.</li>
+</ul>
+<p>  POSIX timers are enabled by default (CONFIG_POSIX_TIMERS=y in</p>
+<p>  defconfig); reaching the path takes only unprivileged syscalls:</p>
+<p>  timer_create(), timer_settime(), a failing execve, kill, and a parent</p>
+<p>  waiting in wait4(). The reaching exit is a FAILING-exec unwind; a plain</p>
+<p>  exit does not reach the path. No capability, no module load, no sysctl.</p>
+<ul>
+<li>Which custom Kconfig/module param/distro setting is required? NONE for</li>
+</ul>
+<p>  the bug. The plain lab build is x86_64_defconfig with build-practical</p>
+<p>  tweaks only (CONFIG_MODULES=n, CONFIG_DEBUG_INFO_BTF=n,</p>
+<p>  CONFIG_SYSTEM_TRUSTED_KEYS unset, CONFIG_DEBUG_INFO_NONE=y,</p>
+<p>  CONFIG_SERIAL_8250_CONSOLE=y); none gate the vulnerable path. The KASAN</p>
+<p>  runs ran on a Debian default-config 6.12 build (6.12.115+deb13.1-amd64)</p>
+<p>  and reproduced 3/3.</p>
+<ul>
+<li>Trigger shape: a MULTITHREADED child whose NON-LEADER thread arms the</li>
+</ul>
+<p>  per-thread POSIX CPU timer and execve()s (forced to fail). A</p>
+<p>  single-threaded child or a plain exit does not reach the path.</p>
+<ul>
+<li>Does the trigger hit in the default config? YES. The crash-only</li>
+</ul>
+<p>  GPF/Oops reproduced on the plain near-defconfig kernel; KASAN is a</p>
+<p>  debug-only amplifier for detection, not a requirement for the bug.</p>
+<ul>
+<li>Open check item: distro variance in posix-cpu-timer knobs (e.g.</li>
+</ul>
+<p>  CONFIG_POSIX_CPU_TIMERS_TASK_WORK) to be confirmed against the upstream</p>
+<p>  fix; does not change the YES.</p>
+<h2>5. Trigger description (sanitized)</h2>
+<p>Pseudocode only: this is not a runnable program and not a working exploit.</p>
+<p>The runnable lab driver stays private and is available to maintainers on</p>
+<p>request.</p>
+<p>1. A parent forks a MULTITHREADED child (at least two threads); the</p>
+<p>   parent later waits in wait4() to reap it.</p>
+<p>2. The child&#x27;s NON-LEADER thread calls</p>
+<p>   timer_create(CLOCK_THREAD_CPUTIME_ID, ...) + timer_settime(): the</p>
+<p>   per-thread CPU timer is what queues the k_itimer&#x27;s cpu_timer node on</p>
+<p>   THAT thread&#x27;s posix_cputimers rbtree. Any other clock leaves the node</p>
+<p>   out of that rbtree and the described read becomes impossible.</p>
+<p>3. That thread execve()s and the exec is forced to FAIL on a late failure</p>
+<p>   path; the unwind returns -EINTR and a delayed kill lands during the</p>
+<p>   killable exec wait; the unwind then runs through get_signal -&gt; do_exit</p>
+<p>   -&gt; exit_itimers(), which frees the k_itimer while its node is still</p>
+<p>   queued; rcu_core later executes the kmem_cache_free().</p>
+<p>4. The parent&#x27;s wait4() reaping runs release_task() -&gt;</p>
+<p>   posix_cpu_timers_exit() -&gt; timerqueue_del(), which reads the timerqueue</p>
+<p>   node of the already-freed k_itimer when reaping lands inside the</p>
+<p>   RCU-free window.</p>
+<p>Race window control: the observable window is between the child&#x27;s exit</p>
+<p>and the RCU grace period that executes the deferred free. The lab driver</p>
+<p>paces reaping with a microsecond-scale kill-delay sweep to land wait4()</p>
+<p>inside that window deterministically. Tuning parameter values stay out of</p>
+<p>this description and remain in the private driver only.</p>
+<p>Demo: the demo artifact is the plain-kernel recording,</p>
+<p>demo98260_v2_nokasan.cast (about 31 seconds of playback, GPF at about</p>
+<p>17 seconds in), showing the real GPF oops on the 6.6.157 plain build on</p>
+<p>the exact analysis path: RIP rb_next, call trace timerqueue_del &lt;-</p>
+<p>posix_cpu_timers_exit &lt;- release_task &lt;- wait_consider_task &lt;- do_wait</p>
+<p>&lt;- wait4. The KASAN recording is retained as the attribution artifact</p>
+<p>(the slab-UAF report), not as the demo.</p>
+<h2>6. Affected range and stability checks</h2>
+<ul>
+<li>Introduced by 55e8c8eb2c7b6bf30e99423ccfe7ca032f498f59 (&quot;posix-cpu-timers:</li>
+</ul>
+<p>  Store a reference to a pid not a task&quot;, Eric W. Biederman; itself fixing</p>
+<p>  e0a7021), i.e. v5.7.0.</p>
+<ul>
+<li>Fixed per stable line: 6.1.191 / 6.6.158 / 6.12.112 / 6.18.54 / 7.2.8;</li>
+</ul>
+<p>  mainline 7.3. Every kernel from 5.7 up to the first fixed release on its</p>
+<p>  line is affected; there is no pre-5.7 exposure. My reproduction tree,</p>
+<p>  6.6.157, sits one patch below the 6.6-line fix.</p>
+<ul>
+<li>Fix lineage (all three commits fresh live-read): 55e8c8eb2c7b (v5.7) -&gt;</li>
+</ul>
+<p>  920f893 + a73d7f9 (Jul 5 2026, CVE-2026-64560, Oleg Nesterov) -&gt;</p>
+<p>  acb03d388181 (Sep 16 2026, complete fix) -&gt; stable backports Oct 3 -&gt;</p>
+<p>  the timers-core-2026-10-20 cleanup pull (merge aaf3d47, Oct 21).</p>
+<ul>
+<li>6.1.191 line-fix claim verified: the kernel.org changelog</li>
+</ul>
+<p>  ChangeLog-6.1.191 carries &quot;exec: Cleanup POSIX timers right after</p>
+<p>  de_thread()&quot; with [ Upstream commit</p>
+<p>  acb03d3881818581052924a9bbbe92b8741ed448 ]. The stable backport commit</p>
+<p>  6f1977cea3e85cd8ab55fb337d3e1725fe61d1ce (Hyunwoo Kim, Sep 11 2026) is</p>
+<p>  verified present in the stable mirror. A public repository&#x27;s</p>
+<p>  &quot;linux-6.1.y unbackported&quot; claim is contradicted by the primary</p>
+<p>  changelog and is not followed.</p>
+<h2>7. Same-file family activity</h2>
+<p>Two distinct same-family fixes around the fix window; dates verified from</p>
+<p>the commits&#x27; own patch headers:</p>
+<ul>
+<li>CVE-2026-98258 fix c21eaa72f02fc6e85621cbe09d303d8fb8bd39cd</li>
+</ul>
+<p>  (&quot;posix-cpu-timers: Prevent freeing a timer which is queued on the</p>
+<p>  expiry list&quot;, Thomas Gleixner), Wed 16 Sep 2026: the expiry-list race.</p>
+<ul>
+<li>8ccd731b63a0183ca2b0e18f3ca15864b3f37eda (&quot;posix-cpu-timers: Fix pid</li>
+</ul>
+<p>  refcount leak in do_cpu_nanosleep() signal path&quot;, Cen Zhang (Microsoft),</p>
+<p>  committed by Thomas Gleixner), Mon 12 Oct 2026: a separate same-family</p>
+<p>  fix (a pid reference leak on the signal path), not a fix for</p>
+<p>  CVE-2026-98258.</p>
+<p>Both sit in the same POSIX-timer/exec family; they are context for the</p>
+<p>area&#x27;s activity, not parts of the CVE-2026-98260 fix.</p>
+<h2>8. Master references currency</h2>
+<p>Master-side code references are stale relative to the</p>
+<p>timers-core-2026-10-20 cleanup pull (merge aaf3d47, Oct 21, &quot;Further</p>
+<p>cleanups for the POSIX timer exit/exec related code&quot;); this analysis stays</p>
+<p>6.6.157-anchored and states that explicitly.</p>
+<h2>9. Safety, scope and public status</h2>
+<ul>
+<li>Not in CISA&#x27;s Known Exploited Vulnerabilities catalog (checked against</li>
+</ul>
+<p>  the catalog feed released 2026-11-13); I have observed no exploitation</p>
+<p>  in the wild.</p>
+<ul>
+<li>Crash-only research finding: the demonstrated trigger is a UAF read;</li>
+</ul>
+<p>  byte-level controlled data was NOT demonstrated in my attempts (three</p>
+<p>  cross-cache reclaim attempts plus a marker run did not place attacker</p>
+<p>  bytes at the read offset; the non-canonical freelist-pointer</p>
+<p>  dereference observed on the plain kernel is itself plain-kernel UAF</p>
+<p>  evidence). No exploit development, no weaponization, no gadget or</p>
+<p>  escalation-chain discussion.</p>
+<ul>
+<li>All lab work loopback/local on my own VMs.</li>
+<li>Public status: disclosed publicly on oss-security on 16 October 2026</li>
+</ul>
+<p>  (V4bel / Hyunwoo Kim), with a public PoC writeup on 26 October and</p>
+<p>  public repositories around the same date (noted as existence only, not</p>
+<p>  verified). I know of no in-flight duplicate on this root cause;</p>
+<p>  acb03d388181 remains the sole fix. The July 19-20 2026 mass-fix window</p>
+<p>  does not cover this area (the POSIX-timer CPU-timer paths are untouched</p>
+<p>  by it). This writeup is an independent-verification record, not a first</p>
+<p>  report; no priority claim is made.</p>
+<ul>
+<li>Severity: CVSS 3.1 6.1 Medium (AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:H).</li>
+</ul>
+<h2>10. Source pin</h2>
+<ul>
+<li>kernel.org linux-6.6.157.tar.xz, published sha256</li>
+</ul>
+<p>  b74a43d0630809b7871cc906ac155e956cbc0b2e78a7451f5e6c8bfcb1208c30</p>
+<p>  (sha256sums.asc read live); the tree Makefile attests 6.6.157.</p>
+<ul>
+<li>Lab builds: plain 6.6.157 #3 own build (x86_64_defconfig with</li>
+</ul>
+<p>  build-practical tweaks only); Debian 6.12.115+deb13.1-amd64</p>
+<p>  default-config build for the KASAN runs.</p>
+<h2>Timeline</h2>
+<ul>
+<li>Sep 5-7, 2026: Gleixner &quot;[patch V2 0/8] exec/exit: POSIX timer related</li>
+</ul>
+<p>  bugfixes&quot; LKML series discussion (public context for the mechanism).</p>
+<ul>
+<li>Sep 11, 2026: V3 posting of the fix; 6.1.y stable backport 6f1977ce.</li>
+<li>Sep 16, 2026: fix acb03d388181 lands mainline (7.3 window); the</li>
+</ul>
+<p>  CVE-2026-98258 fix c21eaa7 lands the same week.</p>
+<ul>
+<li>Oct 3, 2026: stable backports across lines (the 6.6 line fixes at</li>
+</ul>
+<p>  6.6.158).</p>
+<ul>
+<li>Oct 6, 2026: CVE-2026-98258 published (Linux CNA).</li>
+<li>Oct 12, 2026: 8ccd731, the do_cpu_nanosleep() pid refcount leak fix.</li>
+<li>Oct 16, 2026: public disclosure on oss-security (V4bel / Hyunwoo Kim).</li>
+<li>Oct 21, 2026: timers-core-2026-10-20 cleanup pull merged; master-side</li>
+</ul>
+<p>  code references go stale past the fix state.</p>
+<ul>
+<li>Oct 26, 2026: public PoC writeup and public repositories appear.</li>
+<li>Nov 13-17, 2026: my independent reproduction, root-cause analysis and</li>
+</ul>
+<p>  this writeup.</p>
+<h2>PoC demo recording</h2>
+<p>Terminal demo on the plain (non-KASAN) Linux 6.6.157 kernel, recorded in our lab: <a href="assets/demo98260_v2_nokasan.cast">demo98260_v2_nokasan.cast</a> (asciicast v2).</p>
+</article>
+</main>
+<footer>
+<p>VulnAtlas Research &middot; <a href="mailto:vulnatlas@proton.me">vulnatlas@proton.me</a></p>
+</footer>
+</body>
+</html>
