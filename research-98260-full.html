@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CVE-2026-98260: use-after-free of a POSIX CPU timer object across a failed exec (full verification report) | VulnAtlas Research</title>
+<meta name="description" content="VulnAtlas Research full independent verification report for CVE-2026-98260, a use-after-free of a POSIX timer object (k_itimer) in the Linux kernel, reproduced on Linux 6.6.157 and 6.12 (KASAN).">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<header>
+<div class="brand">VulnAtlas Research</div>
+<nav><a href="index.html">Home</a><a href="about.html">About</a><a href="research.html">Research</a><a href="disclosure.html">Disclosure</a><a href="contact.html">Contact</a></nav>
+</header>
+<main>
+<article>
+<h1>CVE-2026-98260: A use-after-free of a POSIX CPU timer object across a failed exec</h1>
+<p class="lede">Independent verification report</p>
+<p class="byline">VulnAtlas Research | 2026-11-20</p>
+<p class="meta">Companion record: the <a href="research.html">2026-11-17 deep-dive writeup</a> for the same CVE stays published as its own page; this report is the full, gate-passed verification record.</p>
+<p>Contribution statement: our contribution is independent verification only: own reproduction, own root-cause analysis and reverse-engineering confirmation in our own lab on Linux 6.6.157. The issue was found and disclosed by Hyunwoo Kim (V4bel), with public disclosure on the oss-security list on 16 October 2026. No priority claim is made.</p>
+<h2>1. Verdict</h2>
+<p>CVE-2026-98260 is a use-after-free of a POSIX timer object (k_itimer) in the Linux kernel&rsquo;s POSIX CPU timer path, reachable from an unprivileged local process when a multithreaded child&rsquo;s non-leader thread arms a per-thread CPU timer and its execve() fails after the point of no return.</p>
+<p>Impact, the headline of this report: the demonstrated base impact is an uncontrolled local kernel crash, a GPF/Oops in the reaping path of a parent reaping an affected child, reproduced on a plain near-defconfig kernel with no special configuration (section 4.1). The escalation route, kernel memory corruption through the stale rbtree node if its page is reclaimed with attacker-influenced contents, is assessed feasible by our analysis (section 4.3) but was NOT demonstrated; external trackers rate the worst case at 7.8 High on that basis, and our published record carries 6.1 Medium (section 4.4). Every kernel from 5.7 up to the first fixed release on its line is affected (section 7). The upstream fix is commit acb03d3881818581052924a9bbbe92b8741ed448 (&ldquo;exec: Cleanup POSIX timers right after de_thread()&rdquo;).</p>
+<p>Our verification evidence, all from our own lab:</p>
+<ul>
+<li>Phase 1 (plain kernel, Linux 6.6.157 near-defconfig build): crash-only GPF/Oops on the analysis path (runs 14 and 16), plus a kill-delay sweep bounding the race window (the 100 us hit and the clean re-capture are observed runs in our lab logs; the 50 us no-hit point is a runbook sweep value, not a pinned lab observation).</li>
+<li>Phase 2 (KASAN kernel, Debian 6.12.115+deb13.1-amd64 default-config build): a deterministic slab-use-after-free report, reproduced 3/3, with the full object lifecycle pinned by the report&rsquo;s own alloc/free/read stacks (alloc task 846, free-executing task 803, reader task 57; three distinct task IDs support the multithreaded-child fact).</li>
+</ul>
+<h2>2. Technical background</h2>
+<p>POSIX CPU timers measure CPU time consumed by a process or thread. A timer created with timer_create(CLOCK_THREAD_CPUTIME_ID) is a per-thread timer: its k_itimer object (a 256-byte allocation from the dedicated slab cache posix_timers_cache) carries a cpu_timer node, and while the timer is armed that node is queued in the rbtree of the thread that armed it (the thread&rsquo;s posix_cputimers structure). The kernel looks the task up by the PID stored on the timer.</p>
+<p>Two properties of the surrounding machinery matter for the bug:</p>
+<ul>
+<li>The k_itimer free is RCU-deferred: exit_itimers() queues the object onto an RCU callback, and rcu_core (softirq context) executes the actual kmem_cache_free() later. The window between the logical free and the physical free is asynchronous and not observable by the exiting task.</li>
+<li>exec() exchanges thread identities: de_thread() swaps which task owns the leader PID. A per-thread CPU timer&rsquo;s PID reference therefore changes meaning across de_thread(): the node stays queued on the original thread&rsquo;s rbtree, but PID lookups for it now resolve differently.</li>
+</ul>
+<h2>3. Root cause: one chain, kill and exec are one event</h2>
+<p>Race anatomy (upstream record, verified against our own reproduction): a non-leader thread B of a multithreaded child arms a per-thread CPU timer (CLOCK_THREAD_CPUTIME_ID); the node is queued on B. B execve()s. de_thread(B) exchanges TIDs, so B&rsquo;s PID now belongs to the leader. If the leader is reaped at this point, release_task(leader) -&gt; posix_cpu_timers_exit(leader) cleans the leader&rsquo;s queue, not B&rsquo;s. The exec continues. Because bprm-&gt;point_of_no_return is set BEFORE de_thread(), any later failure path (unshare_files(), set_mm_exe_file(), exec_mmap() or exec_task_namespaces() failing, or a SIGKILL landing during the killable exec wait in exec_mmap()&rsquo;s mmap_read_lock_killable()) brings the task down before begin_new_exec() reaches the cleanup. The unwind runs through get_signal() -&gt; do_exit() -&gt; exit_itimers(), which frees the k_itimer (posix_timer_delete() -&gt; posix_cpu_timer_del() -&gt; posix_timer_unhash_and_free(), and the deferred kmem_cache_free()) while its node is still queued: exit_itimers() SKIPS the disarm of the queued node here. That is the bug.</p>
+<p>The parent&rsquo;s wait4() reaping then runs release_task() -&gt; posix_cpu_timers_exit() -&gt; timerqueue_del() on the freed node: a use-after-free.</p>
+<p>In the normal (success) case the state stays invisible because begin_new_exec() calls posix_cpu_timers_exit(me) right after exec_task_namespaces(), which removes the leftover node. Only the failing-exec unwind reaches the bug; a plain (non-exec) exit cannot reach it, per the upstream record and our own driver design.</p>
+<p>Proof of the exec precondition in our runs is the observed timer_lock_sighand() failed-lookup WARNING (kernel/time/posix-cpu-timers.c:564), which fires when the node is still queued but the PID lookup fails - not the free stack, whose exec frames are already gone after the -EINTR unwind.</p>
+<h3>The fix</h3>
+<p>acb03d388181 (&ldquo;exec: Cleanup POSIX timers right after de_thread()&rdquo;, fs/exec.c, +21/-8; Signed-off-by Hyunwoo Kim and Thomas Gleixner; Reviewed-by Oleg Nesterov and Frederic Weisbecker; Cc: stable) does not add a barrier at exit or harden the reap-time walk. It creates a helper posixtimer_exec() - posix_cpu_timers_exit(me) + exit_itimers(me) + flush_itimer_signals() under the sighand siglock, gated on CONFIG_POSIX_TIMERS - and calls it in begin_new_exec() immediately after de_thread() returns success, removing the identical cleanup block from its old, later position. The commit message states the requirement: the cleanup must run there so that CPU timers armed on the current task are dequeued before any post-point_of_no_return failure path can bring the task down; after the TID switch, a later deletion of the timer would not remove an enqueued timer because the old-TID lookup fails.</p>
+<h2>4. Impact analysis</h2>
+<h3>4.1 Confirmed impact: local kernel crash</h3>
+<p>The demonstrated trigger is a use-after-free read. On the plain (non-KASAN) 6.6.157 build it presents as a GPF/Oops in the reaping path:</p>
+<pre><code>Oops: 0002 [#1] PREEMPT SMP NOPTI
+  timerqueue_del+0x2e/0x70
+  posix_cpu_timers_exit+0x8d/0xc0
+  release_task+0xf3/0x500
+  ...
+</code></pre>
+<p>The crash path is the parent reaping an exited child: release_task() -&gt; posix_cpu_timers_exit() -&gt; timerqueue_del() dereferences the freed node&rsquo;s rbtree fields.</p>
+<p>The fault signature is heterogeneous across runs in our groom campaign: GPF (RDX = 0x004a801d00000000, faulting access [RDX+0x10]), page-fault not-present, and NULL-deref variants, with fault CLASS varying while fault RATE stays deterministic (1/1 on the direct driver, 4/4 on the groom variant in the recorded campaign). The heterogeneity is itself the fingerprint of uncontrolled reuse: what the freed object&rsquo;s rb fields hold depends on what the slab has done with the memory since.</p>
+<h3>4.2 The KASAN record</h3>
+<p>On the Debian default-config 6.12 build the same sequence yields a deterministic slab-use-after-free report, reproduced 3/3 (excerpted from our lab log):</p>
+<pre><code>BUG: KASAN: slab-use-after-free in timerqueue_del+0x100/0x130
+Read of size 8 at addr ffff888003a04078 by task trigger98260/57
+  timerqueue_del+0x100/0x130
+  posix_cpu_timers_exit+0x180/0x240
+  release_task+0x244/0x13a0
+Allocated by task 846: ...
+Freed by task 803:
+  exit_itimers+0x347/0x620 -&gt; __call_rcu_common
+  ... (executed later by rcu_core, kmem_cache_free)
+The buggy address belongs to the object at ffff888003a04000
+  which belongs to the cache posix_timers_cache of size 256
+</code></pre>
+<p>The free stack&rsquo;s do_group_exit() -&gt; do_exit() -&gt; exit_itimers+0x347 -&gt; __call_rcu_common is the tail of the SAME chain as the upstream exec-failure path - the non-leader thread fails execve on a late failure path, the exec unwinds (-EINTR), the delayed kill lands during the killable exec wait. Kill and exec are one chain. The log&rsquo;s second exit_itimers frame (+0x4b5, with posix_cpu_timer_del) is the same teardown event&rsquo;s disarm/delete call site, not a second free path.</p>
+<h3>4.3 Escalation potential (analytic, not demonstrated)</h3>
+<p>Escalation potential: plausible but undemonstrated. The demonstrated primitive is a UAF read; byte-level controlled data was NOT demonstrated in our attempts.</p>
+<p>Chain to maximum demonstrated impact, weakest prerequisite to strongest demonstrated effect: an unprivileged local process (no capability, no module load, no sysctl) -&gt; a multithreaded child whose non-leader thread arms a per-thread CLOCK_THREAD_CPUTIME_ID timer -&gt; an exec made to fail after the point of no return (SIGKILL landing in the killable exec wait) -&gt; a parent reaping inside the RCU-free window -&gt; strongest demonstrated impact: a deterministic use-after-free read that presents as an uncontrolled local kernel crash (GPF/Oops on the plain kernel; the same read under KASAN as the slab-use-after-free report of section 4.2). Everything past that ceiling is analytic, not demonstrated (the cross-cache route below).</p>
+<p>We characterized the reclaim behaviour directly (source reads plus recorded groom runs):</p>
+<ul>
+<li>Same-cache reclaim (spraying fresh timer_create() allocations): hits the right cache (posix_timers_cache) but cannot carry attacker bytes into the freed object. The cache is a dedicated kmem_cache and the allocation path is kmem_cache_zalloc(): a reclaiming CLOCK_MONOTONIC timer zeroes its hrtimer, including the embedded timerqueue node, at init; and sigev_value is stored outside k_itimer, in the separate sigqueue object (kernel/time/posix-timers.c:489 in the published 6.6.157 source). Same-cache reuse therefore yields deterministic kernel-written (zero) contents at the rb offsets: a clean deterministic-reuse demonstration, never attacker-chosen bytes.</li>
+<li>System-V message-queue sprays (msgsnd-class objects) structurally cannot reclaim a k_itimer at all: the spray objects land in a kmalloc bucket, the victim lives in the dedicated posix_timers_cache. Our own first groom design made this mistake and we record it here as a negative result: the 0x41 &ldquo;misses&rdquo; were a cache mismatch, not tuning noise.</li>
+<li>Attacker-chosen bytes require cross-cache page-level reclaim: drain the victim&rsquo;s slab page (all k_itimers on it freed, so SLUB releases the page back), wait out the RCU-deferred frees, then page-fill spray with controlled content. Assessed feasible; it requires a page-drain churn design, an RCU-aware spray window (spray AFTER the rcu_core callback, not a fixed delay), and page-order-matched spray sizing. We have NOT performed this; the config is parked in our lab.</li>
+</ul>
+<p>External corroboration of the framing: Red Hat&rsquo;s statement for the CVE reads &ldquo;The confirmed impact is a local kernel crash. The stale rbtree node also provides a plausible memory corruption condition that may permit privilege escalation if the freed allocation is reused with attacker influenced contents.&rdquo; (Red Hat CVE database, live-read 2026-11-19.)</p>
+<h3>4.4 Severity</h3>
+<p>Our published record carries CVSS 3.1 6.1 Medium (AV:L/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:H), anchored on the demonstrated impact (uncontrolled local kernel crash). External trackers rate the same primitive higher on the confidentiality/integrity axes: the Linux CNA and NVD rate 7.8 (AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H), SUSE rates 7 (v3, AC:H variant) and 7.3 (v4), Red Hat rates 7.0, and the public PoC writeup&rsquo;s table carries 7.8 High. The divergence is exactly the controlled-data question in 4.3: the external scores price the escalation route our analysis assesses feasible but does not demonstrate, and our score stays anchored on what is demonstrated. Both readings are recorded here as their sources state them.</p>
+<h2>5. Production reachability</h2>
+<p>Per the finding-template reachability field:</p>
+<ul>
+<li>Is the vulnerable code path reachable in the default/production config? YES. POSIX timers are enabled by default (CONFIG_POSIX_TIMERS=y in defconfig); reaching the path takes only unprivileged syscalls: timer_create(), timer_settime(), a failing execve, kill, and a parent waiting in wait4(). No capability, no module load, no sysctl.</li>
+<li>Which custom Kconfig/module param/distro setting is required? NONE for the bug. Our plain lab build is x86_64_defconfig with build-practical tweaks only (CONFIG_MODULES=n, CONFIG_DEBUG_INFO_BTF=n, CONFIG_SYSTEM_TRUSTED_KEYS unset, CONFIG_DEBUG_INFO_NONE=y, CONFIG_SERIAL_8250_CONSOLE=y); none gate the vulnerable path. The KASAN runs ran on a Debian default-config 6.12 build (6.12.115+deb13.1-amd64) and reproduced 3/3.</li>
+<li>Does the trigger hit in the default config? YES. The crash-only GPF/Oops reproduced on the plain near-defconfig kernel; KASAN is a debug-only amplifier for detection, not a requirement for the bug.</li>
+<li>Trigger shape: a MULTITHREADED child whose NON-LEADER thread arms the per-thread CPU timer and execve()s (forced to fail). A single-threaded child or a plain exit does not reach the path.</li>
+<li>Open check item: distro variance in posix-cpu-timer knobs (e.g. CONFIG_POSIX_CPU_TIMERS_TASK_WORK) to be confirmed against the upstream fix; it does not change the YES.</li>
+</ul>
+<h2>6. Reproduction methodology overview (sanitized)</h2>
+<p>Pseudocode only: this is not a runnable program and not a working exploit. The runnable lab driver stays private and is available to maintainers on request.</p>
+<ol>
+<li>A parent forks a MULTITHREADED child (at least two threads); the parent later waits in wait4() to reap it.</li>
+<li>The child&rsquo;s NON-LEADER thread calls timer_create(CLOCK_THREAD_CPUTIME_ID, &hellip;) + timer_settime(): the per-thread CPU timer is what queues the k_itimer&rsquo;s cpu_timer node on THAT thread&rsquo;s posix_cputimers rbtree. Any other clock leaves the node out of that rbtree and the described read becomes impossible.</li>
+<li>That thread execve()s, and the exec is made to fail after the point of no return. The concrete mechanism, ours and the one documented in the upstream record, is delivering SIGKILL to that thread (tgkill on the non-leader thread&rsquo;s TID) while it sits in the killable wait inside exec_mmap()&rsquo;s mmap_read_lock_killable(): the exec unwinds with -EINTR, the signal is then taken through get_signal -&gt; do_exit -&gt; exit_itimers(), which frees the k_itimer while its node is still queued; rcu_core later executes the kmem_cache_free().</li>
+<li>The parent&rsquo;s wait4() reaping runs release_task() -&gt; posix_cpu_timers_exit() -&gt; timerqueue_del(), which reads the timerqueue node of the already-freed k_itimer when reaping lands inside the RCU-free window.</li>
+</ol>
+<p>Race window control: the observable window is between the child&rsquo;s exit and the RCU grace period that executes the deferred free. The lab driver paces reaping with a microsecond-scale kill-delay sweep to land wait4() inside that window deterministically. Tuning parameter values stay out of this description and remain in the private driver only.</p>
+<p>Demo: the demo artifact is the plain-kernel recording, demo98260_v2_nokasan.cast (about 31 seconds of playback, GPF at about 17 seconds in), showing the real GPF oops on the 6.6.157 plain build on the exact analysis path: RIP rb_next, call trace timerqueue_del &lt;- posix_cpu_timers_exit &lt;- release_task &lt;- wait_consider_task &lt;- do_wait &lt;- wait4. The KASAN recording is retained as the attribution artifact (the slab-UAF report), not as the demo.</p>
+<p>Lab builds: Linux 6.6.157 own build (x86_64_defconfig plus build-practical tweaks; source pinned to kernel.org linux-6.6.157.tar.xz, published sha256 b74a43d0630809b7871cc906ac155e956cbc0b2e78a7451f5e6c8bfcb1208c30) and a Debian 6.12.115+deb13.1-amd64 default-config build for the KASAN runs. All lab work loopback/local on our own VMs.</p>
+<h2>7. Affected range and fix lineage</h2>
+<ul>
+<li>Introduced by 55e8c8eb2c7b6bf30e99423ccfe7ca032f498f59 (&ldquo;posix-cpu-timers: Store a reference to a pid not a task&rdquo;, Eric W. Biederman), i.e. v5.7.0. Every kernel from 5.7 up to the first fixed release on its line is affected; there is no pre-5.7 exposure.</li>
+<li>Fixed per stable line: 6.1.191 / 6.6.158 / 6.12.112 / 6.18.54 / 7.2.8; mainline 7.3. Our reproduction tree, 6.6.157, sits one patch below the 6.6-line fix.</li>
+<li>Fix lineage: 55e8c8eb2c7b (v5.7) -&gt; 920f893 + a73d7f9 (Jul 5 2026, CVE-2026-64560, Oleg Nesterov) -&gt; acb03d388181 (Sep 16 2026, complete fix) -&gt; stable backports from Oct 3 -&gt; the timers-core-2026-10-20 cleanup pull (merge aaf3d47, Oct 21).</li>
+<li>The 6.1.191 line-fix claim is verified against the primary kernel.org changelog (ChangeLog-6.1.191 carries &ldquo;exec: Cleanup POSIX timers right after de_thread()&rdquo; with [ Upstream commit acb03d3881818581052924a9bbbe92b8741ed448 ]). The stable backport commit 6f1977cea3e85cd8ab55fb337d3e1725fe61d1ce (Hyunwoo Kim, Sep 11 2026) is verified present in the stable mirror. A public repository&rsquo;s &ldquo;linux-6.1.y unbackported&rdquo; claim is contradicted by the primary changelog and is not followed.</li>
+</ul>
+<h2>8. Vendor wave status and distro coverage (live-read 2026-11-19, ~10:20 IST)</h2>
+<ul>
+<li>SUSE (suse.com/security/cve/CVE-2026-98260.html, live-read): overall state &ldquo;Pending&rdquo;, severity &ldquo;important&rdquo;. CVSS v3: Linux CNA 7.8, NVD 7.8, SUSE 7 (AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H); CVSS v4 (SUSE): 7.3. SUSE advisories listed on the page: ESSA-2026:0187 (published Oct 22, 15:07 UTC); kernel updates RHSA-2026:85321 (Oct 21) and RHSA-2026:86033 (Oct 22) listed alongside (RHSA-numbered items are Red Hat advisories that the SUSE page cross-lists as related references, not SUSE advisories). SUSE Bugzilla entries: 1284408 [NEW], 1285052 [NEW], 1286032 [IN_PROGRESS]. Live patches for SLES 15 SP4/SP6/SP7 covering this CVE (Live Patch 60 for SP4, kernel 5.14.21-150400.24.243; Live Patch 32 for SP6, 6.4.0-150600.23.138; Live Patch 22 for SP7, 6.4.0-150700.53.84, SUSE-SU-2026:5316-1) and the SUSE-SU-2026:4940-1 update (published Oct 29, 23:03 CET) are carried by index snapshots dated Nov 17-18; the numbers are dated readings, not live re-reads of each advisory.</li>
+<li>Debian (security-tracker.debian.org/tracker/CVE-2026-98260, live-read): bookworm 6.1.176-1 vulnerable, bookworm (security) 6.1.192-2 fixed; trixie 6.12.107-1 vulnerable, trixie (security) 6.12.117-1 fixed; forky 7.3.4-1 and sid 7.3.5-1 fixed; linux-6.12 backport 6.12.117-1~deb12u1 fixed. Advisories: DSA-6568-1, DLA-4841-1, DLA-4850-1.</li>
+<li>Red Hat (access.redhat.com/security/cve/cve-2026-98260, live-read): statement confirms a lifecycle race, confirmed impact &ldquo;a local kernel crash&rdquo;, escalation &ldquo;plausible&hellip; may permit privilege escalation&rdquo; (quoted in 4.3); CVSS 7.0 (Red Hat); Bugzilla 2546491; &ldquo;Mitigation for this issue is either not available or&hellip;&rdquo; per Red Hat Product Security criteria. Package states: RHEL 10 shown as &ldquo;Affected&rdquo; in the tracker snapshot (partial read; the full product matrix was not enumerated this run).</li>
+<li>Ubuntu: the Ubuntu tracker (ubuntu.com/security/CVE-2026-98260) is referenced by the Debian tracker&rsquo;s source list; it was not read live this run, so no Ubuntu state is asserted here.</li>
+<li>MITRE/NVD: the CVE record carries the upstream fix description and the &ldquo;In short&rdquo; walkthrough quoted above; NVD base score 7.8 (via SUSE&rsquo;s table).</li>
+<li>Exploitation status: the public PoC writeup and public repositories have existed since around Oct 26 2026 (Sploitus-indexed; the writeup&rsquo;s own table carries CVSS 7.8 High). Third-party threat pages (index snapshots Nov 17-18) note public PoC repositories and tooling and a honeypot-sensor note; existence-based, not a confirmation of in-the-wild exploitation. Not in CISA&rsquo;s Known Exploited Vulnerabilities catalog as of our feed check on 2026-11-13. We have observed no exploitation in the wild.</li>
+</ul>
+<h2>9. Timeline</h2>
+<ul>
+<li>Sep 5-7, 2026: Gleixner &ldquo;[patch V2 0/8] exec/exit: POSIX timer related bugfixes&rdquo; LKML series discussion (public context for the mechanism).</li>
+<li>Sep 11, 2026: V3 posting of the fix; 6.1.y stable backport 6f1977ce.</li>
+<li>Sep 16, 2026: fix acb03d388181 lands mainline (7.3-rc4); the CVE-2026-98258 fix c21eaa7 lands the same week.</li>
+<li>Oct 3, 2026: stable backports across lines (the 6.6-line fix at 6.6.158).</li>
+<li>Oct 6-7, 2026: CVE-2026-98258 published (Linux CNA); vendor trackers open their pages for CVE-2026-98260 (SUSE CVE page created Oct 7); SentinelOne publishes an advisory (Oct 6).</li>
+<li>Oct 12, 2026: 8ccd731b63a0, the do_cpu_nanosleep() pid refcount leak fix (Cen Zhang, committed by Thomas Gleixner).</li>
+<li>Oct 16, 2026: public disclosure on oss-security (V4bel / Hyunwoo Kim).</li>
+<li>Oct 21-22, 2026: timers-core-2026-10-20 cleanup pull merged (Oct 21); SUSE ESSA-2026:0187 (Oct 22); RHSA-2026:85321 (Oct 21) and RHSA-2026:86033 (Oct 22) listed on SUSE&rsquo;s page.</li>
+<li>Oct 26, 2026: public PoC writeup and public repositories appear.</li>
+<li>Oct 29, 2026: SUSE-SU-2026:4940-1 (per index snapshot).</li>
+<li>Nov 13-17, 2026: our independent reproduction, root-cause analysis, and the first published writeup (research.html, 2026-11-17).</li>
+<li>Nov 18-19, 2026: groom-campaign RCA (reclaim behaviour characterization) and this report draft.</li>
+</ul>
+<h2>10. Related activity in the same area</h2>
+<p>Two distinct same-family fixes around the fix window (dates from the commits&rsquo; own patch headers):</p>
+<ul>
+<li>CVE-2026-98258 fix c21eaa72f02fc6e85621cbe09d303d8fb8bd39cd (&ldquo;posix-cpu-timers: Prevent freeing a timer which is queued on the expiry list&rdquo;, Thomas Gleixner), Sep 16 2026: the expiry-list race.</li>
+<li>8ccd731b63a0183ca2b0e18f3ca15864b3f37eda (&ldquo;posix-cpu-timers: Fix pid refcount leak in do_cpu_nanosleep() signal path&rdquo;, Cen Zhang (Microsoft), committed by Thomas Gleixner), Oct 12 2026: a separate same-family fix, not a fix for CVE-2026-98258.</li>
+</ul>
+<p>Both sit in the same POSIX-timer/exec family; they are context for the area&rsquo;s activity, not parts of the CVE-2026-98260 fix.</p>
+<h2>11. Scope, attribution and public status</h2>
+<ul>
+<li>This is an independent-verification record, not a first report. The issue was found and disclosed by Hyunwoo Kim (V4bel); public disclosure on oss-security on 16 October 2026; public PoC writeup and repositories around 26 October 2026 (noted as existence only). No priority claim is made.</li>
+<li>Dup diligence: no in-flight duplicate on our root cause is known; acb03d388181 remains the sole fix. Our identifier searches (Nov 14) found no other public writeup treating this root cause; the nearest public research in the same area is the same-family fix set in section 10 (CVE-2026-98258 and the do_cpu_nanosleep refcount fix), none of which treats this root cause.</li>
+<li>Not a weaponization record: no exploit development, no gadget or escalation-chain discussion beyond the analytic framing in 4.3; controlled data was not achieved; no grooming or spray parameters are published here.</li>
+<li>The July 19-20 2026 mass-fix window does not cover this area (the POSIX-timer CPU-timer paths are untouched by it).</li>
+<li>Master-side code references are stale relative to the timers-core-2026-10-20 cleanup pull (merge aaf3d47, Oct 21); this analysis stays 6.6.157-anchored and states that explicitly.</li>
+</ul>
+<h2>12. Sources</h2>
+<p>Primary (live-read by VulnAtlas Research, dates as noted):
+1. Linux kernel commit acb03d3881818581052924a9bbbe92b8741ed448, its commit message and V3 posting (Sep 11 2026).
+2. Stable backport 6f1977cea3e85cd8ab55fb337d3e1725fe61d1ce; kernel.org ChangeLog-6.1.191 (live-read Nov 15).
+3. MiCode-independent reference trees and configs as cited in the first writeup; kernel.org linux-6.6.157.tar.xz (published sha256 b74a43d0&hellip;).
+4. oss-security public disclosure, 16 Oct 2026 (V4bel / Hyunwoo Kim).
+5. Our own lab logs: kasan_run_full.log, crash runs 14/16, groom campaign logs and the groom-miss RCA (Nov 15-18).</p>
+<p>Vendor and tracker pages (live-read 2026-11-19 unless marked snapshot):
+6. SUSE CVE page: https://www.suse.com/security/cve/CVE-2026-98260.html
+7. Debian tracker: https://security-tracker.debian.org/tracker/CVE-2026-98260
+8. Red Hat CVE database: https://access.redhat.com/security/cve/cve-2026-98260
+9. Ubuntu tracker (listed, not read this run): https://ubuntu.com/security/CVE-2026-98260
+10. SentinelOne advisory (Oct 6-7, index snapshot): https://www.sentinelone.com/vulnerability-database/cve-2026-98260/
+11. OffSeq threat pages for the SUSE live patches (index snapshots Nov 17-18): https://radar.offseq.com/threat/security-update-for-the-linux-kernel-live-patch-32-for-suse-linux-enterprise-15-sp6-d25818ccfd2f35d4 and the SP4/SP7 equivalents.
+12. Public PoC writeup (Sploitus index, Oct 26 snapshot): https://sploitus.com/exploit?id=6171441E-0BFD-5B14-9AF8-770BFABD0871
+13. CISA KEV catalog feed (checked 2026-11-13 by VulnAtlas Research).</p>
+</article>
+</main>
+<footer>
+<p>VulnAtlas Research &middot; <a href="mailto:vulnatlas@proton.me">vulnatlas@proton.me</a></p>
+</footer>
+</body>
+</html>
